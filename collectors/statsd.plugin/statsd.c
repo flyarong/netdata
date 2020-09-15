@@ -1014,7 +1014,8 @@ void *statsd_collector_thread(void *ptr) {
             , statsd_rcv_callback
             , statsd_snd_callback
             , statsd_timer_callback
-            , NULL
+            , NULL                     // No access control pattern
+            , 0                        // No dns lookups for access control pattern
             , (void *)d
             , 0                        // tcp request timeout, 0 = disabled
             , statsd.tcp_idle_timeout  // tcp idle timeout, 0 = disabled
@@ -1067,7 +1068,7 @@ static const char *valuetype2string(STATSD_APP_CHART_DIM_VALUE_TYPE type) {
 }
 
 static STATSD_APP_CHART_DIM *add_dimension_to_app_chart(
-        STATSD_APP *app
+        STATSD_APP *app __maybe_unused
         , STATSD_APP_CHART *chart
         , const char *metric_name
         , const char *dim_name
@@ -1323,7 +1324,7 @@ static int statsd_readfile(const char *filename, STATSD_APP *app, STATSD_APP_CHA
             else if (!strcmp(name, "dimension")) {
                 // metric [name [type [multiplier [divisor]]]]
                 char *words[10];
-                pluginsd_split_words(value, words, 10);
+                pluginsd_split_words(value, words, 10, NULL, NULL, 0);
 
                 int pattern = 0;
                 size_t i = 0;
@@ -1460,6 +1461,8 @@ static inline RRDSET *statsd_private_rrdset_create(
             , chart_type      // chart type
             , memory_mode     // memory mode
             , history         // history
+            , 0               // not archived
+            , NULL            // no known UUID
     );
     rrdset_flag_set(st, RRDSET_FLAG_STORE_FIRST);
 
@@ -1998,6 +2001,8 @@ static inline void statsd_update_app_chart(STATSD_APP *app, STATSD_APP_CHART *ch
                 , chart->chart_type         // chart type
                 , app->rrd_memory_mode      // memory mode
                 , app->rrd_history_entries  // history
+                , 0                         // not archived
+                , NULL                      // no known UUID
         );
 
         rrdset_flag_set(chart->st, RRDSET_FLAG_STORE_FIRST);
@@ -2222,7 +2227,7 @@ void *statsd_main(void *ptr) {
     // ----------------------------------------------------------------------------------------------------------------
     // statsd setup
 
-    if(!statsd.enabled) return NULL;
+    if(!statsd.enabled) goto cleanup;
 
     statsd_listen_sockets_setup();
     if(!statsd.sockets.opened) {

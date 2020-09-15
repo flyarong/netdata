@@ -715,15 +715,18 @@ static void nfacct_send_metrics() {
                 printf("CHART netfilter.nfacct_packets '' 'Netfilter Accounting Packets' 'packets/s'\n");
                 printf("DIMENSION %s '' incremental 1 %d\n", d->name, nfacct_root.update_every);
             }
-            printf(
-                    "BEGIN netfilter.nfacct_packets\n"
-                    "SET %s = %lld\n"
-                    "END\n"
+        }
+    }
+    printf("BEGIN netfilter.nfacct_packets\n");
+    for(d = nfacct_root.nfacct_metrics; d ; d = d->next) {
+        if(likely(d->updated)) {
+            printf("SET %s = %lld\n"
                     , d->name
                     , (collected_number)d->pkts
             );
         }
     }
+    printf("END\n");
 
     // ----------------------------------------------------------------
 
@@ -743,18 +746,45 @@ static void nfacct_send_metrics() {
                 printf("CHART netfilter.nfacct_bytes '' 'Netfilter Accounting Bandwidth' 'kilobytes/s'\n");
                 printf("DIMENSION %s '' incremental 1 %d\n", d->name, 1000 * nfacct_root.update_every);
             }
-            printf(
-                   "BEGIN netfilter.nfacct_bytes\n"
-                   "SET %s = %lld\n"
-                   "END\n"
+        }
+    }
+    printf("BEGIN netfilter.nfacct_bytes\n");
+    for(d = nfacct_root.nfacct_metrics; d ; d = d->next) {
+        if(likely(d->updated)) {
+            printf("SET %s = %lld\n"
                    , d->name
                    , (collected_number)d->bytes
             );
         }
     }
+    printf("END\n");
 }
 
 #endif // HAVE_LIBNETFILTER_ACCT
+
+static void nfacct_signal_handler(int signo)
+{
+    exit((signo == SIGPIPE)?1:0);
+}
+
+// When Netdata crashes this plugin was becoming zombie,
+// this function was added to remove it when sigpipe and other signals are received.
+void nfacct_signals()
+{
+    int signals[] = { SIGPIPE, SIGINT, SIGTERM, 0};
+    int i;
+    struct sigaction sa;
+    sa.sa_flags = 0;
+    sa.sa_handler = nfacct_signal_handler;
+
+    // ignore all signals while we run in a signal handler
+    sigfillset(&sa.sa_mask);
+
+    for (i = 0; signals[i]; i++) {
+        if(sigaction(signals[i], &sa, NULL) == -1)
+            error("Cannot add the handler to signal %d", signals[i]);
+    }
+}
 
 int main(int argc, char **argv) {
 
@@ -827,6 +857,8 @@ int main(int argc, char **argv) {
         error("nfacct.plugin: ignoring parameter '%s'", argv[i]);
     }
 
+    nfacct_signals();
+
     errno = 0;
 
     if(freq >= netdata_update_every)
@@ -835,12 +867,12 @@ int main(int argc, char **argv) {
         error("update frequency %d seconds is too small for NFACCT. Using %d.", freq, netdata_update_every);
 
 #ifdef DO_NFACCT
-    if(debug) fprintf(stderr, "freeipmi.plugin: calling nfacct_init()\n");
+    if(debug) fprintf(stderr, "nfacct.plugin: calling nfacct_init()\n");
     int nfacct = !nfacct_init(netdata_update_every);
 #endif
 
 #ifdef DO_NFSTAT
-    if(debug) fprintf(stderr, "freeipmi.plugin: calling nfstat_init()\n");
+    if(debug) fprintf(stderr, "nfacct.plugin: calling nfstat_init()\n");
     int nfstat = !nfstat_init(netdata_update_every);
 #endif
 

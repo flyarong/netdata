@@ -29,10 +29,13 @@
 #  - hipchat notifications by @ktsaou #1561
 #  - fleep notifications by @Ferroin
 #  - prowlapp.com notifications by @Ferroin
+#  - irc notifications by @manosf
 #  - custom notifications by @ktsaou
 #  - syslog messages by @Ferroin
 #  - Microsoft Team notification by @tioumen
 #  - RocketChat notifications by @Hermsi1337 #3777
+#  - Google Hangouts Chat notifications by @EnzoAkira and @hendrikhofstadt
+#  - Dynatrace Event by @illumine
 
 # -----------------------------------------------------------------------------
 # testing notifications
@@ -163,9 +166,13 @@ custom
 msteam
 kavenegar
 prowl
+irc
 awssns
 rocketchat
 sms
+hangouts
+dynatrace
+matrix
 "
 
 # -----------------------------------------------------------------------------
@@ -189,11 +196,12 @@ fi
 [ -z "${NETDATA_STOCK_CONFIG_DIR}" ] && NETDATA_STOCK_CONFIG_DIR="@libconfigdir_POST@"
 [ -z "${NETDATA_CACHE_DIR}" ] && NETDATA_CACHE_DIR="@cachedir_POST@"
 [ -z "${NETDATA_REGISTRY_URL}" ] && NETDATA_REGISTRY_URL="https://registry.my-netdata.io"
+[ -z "${NETDATA_REGISTRY_CLOUD_BASE_URL}" ] && NETDATA_REGISTRY_CLOUD_BASE_URL="https://app.netdata.cloud"
 
 # -----------------------------------------------------------------------------
 # parse command line parameters
 
-if [ ${1} = "unittest" ]; then
+if [[ ${1} = "unittest" ]]; then
 	unittest=1        # enable unit testing mode
 	roles="${2}"      # the role that should be used for unit testing
 	cfgfile="${3}"    # the location of the config file to use for unit testing
@@ -344,6 +352,10 @@ FLEEP_SENDER="${host}"
 # Amazon SNS configs
 AWSSNS_MESSAGE_FORMAT=
 
+# Matrix configs
+MATRIX_HOMESERVER=
+MATRIX_ACCESSTOKEN=
+
 # syslog configs
 SYSLOG_FACILITY=
 
@@ -351,11 +363,25 @@ SYSLOG_FACILITY=
 EMAIL_SENDER=
 EMAIL_CHARSET=$(locale charmap 2>/dev/null)
 EMAIL_THREADING=
+EMAIL_PLAINTEXT_ONLY=
 
 # irc configs
 IRC_NICKNAME=
 IRC_REALNAME=
 IRC_NETWORK=
+
+# hangouts configs
+declare -A HANGOUTS_WEBHOOK_URI
+
+# dynatrace configs
+DYNATRACE_SPACE=
+DYNATRACE_SERVER=
+DYNATRACE_TOKEN=
+DYNATRACE_TAG_VALUE=
+DYNATRACE_ANNOTATION_TYPE=
+DYNATRACE_EVENT=
+SEND_DYNATRACE=
+
 
 # load the stock and user configuration files
 # these will overwrite the variables above
@@ -384,7 +410,7 @@ if [ -z ${EMAIL_CHARSET} ]; then
 fi
 
 # If we've been asked to use FQDN's for the URL's in the alarm, do so,
-# unless we're sending an alarm for a slave system which we can't get the
+# unless we're sending an alarm for a child system which we can't get the
 # FQDN of easily.
 if [ "${use_fqdn}" = "YES" ] && [ "${host}" = "$(hostname -s 2>/dev/null)" ]; then
 	host="$(hostname -f 2>/dev/null)"
@@ -489,9 +515,22 @@ filter_recipient_by_criticality() {
 # check irc
 [ -z "${IRC_NETWORK}" ] && SEND_IRC="NO"
 
+# check hangouts
+[ ${#HANGOUTS_WEBHOOK_URI[@]} -eq 0 ] && SEND_HANGOUTS="NO"
+
 # check fleep
 #shellcheck disable=SC2153
 { [ -z "${FLEEP_SERVER}" ] || [ -z "${FLEEP_SENDER}" ]; } && SEND_FLEEP="NO"
+
+# check dynatrace
+{ [ -z "${DYNATRACE_SPACE}" ] ||
+  [ -z "${DYNATRACE_SERVER}" ] ||
+  [ -z "${DYNATRACE_TOKEN}" ] ||
+  [ -z "${DYNATRACE_TAG_VALUE}" ] ||
+  [ -z "${DYNATRACE_EVENT}" ]; } && SEND_DYNATRACE="NO"
+
+# check matrix
+{ [ -z "${MATRIX_HOMESERVER}" ] || [ -z "${MATRIX_ACCESSTOKEN}" ]; } && SEND_MATRIX="NO"
 
 if [ "${SEND_PUSHOVER}" = "YES" ] ||
 	[ "${SEND_SLACK}" = "YES" ] ||
@@ -509,8 +548,11 @@ if [ "${SEND_PUSHOVER}" = "YES" ] ||
 	[ "${SEND_KAFKA}" = "YES" ] ||
 	[ "${SEND_FLEEP}" = "YES" ] ||
 	[ "${SEND_PROWL}" = "YES" ] ||
+	[ "${SEND_HANGOUTS}" = "YES" ] ||
+	[ "${SEND_MATRIX}" = "YES" ] ||
 	[ "${SEND_CUSTOM}" = "YES" ] ||
-	[ "${SEND_MSTEAM}" = "YES" ]; then
+	[ "${SEND_MSTEAM}" = "YES" ] ||
+	[ "${SEND_DYNATRACE}" = "YES" ]; then
 	# if we need curl, check for the curl command
 	if [ -z "${curl}" ]; then
 		curl="$(command -v curl 2>/dev/null)"
@@ -534,7 +576,10 @@ if [ "${SEND_PUSHOVER}" = "YES" ] ||
 		SEND_KAFKA="NO"
 		SEND_FLEEP="NO"
 		SEND_PROWL="NO"
+		SEND_HANGOUTS="NO"
+		SEND_MATRIX="NO"
 		SEND_CUSTOM="NO"
+		SEND_DYNATRACE="NO"
 	fi
 fi
 
@@ -654,12 +699,17 @@ for method in "${SEND_EMAIL}" \
 	"${SEND_KAFKA}" \
 	"${SEND_PD}" \
 	"${SEND_FLEEP}" \
+	"${SEND_PROWL}" \
+	"${SEND_MATRIX}" \
 	"${SEND_CUSTOM}" \
 	"${SEND_IRC}" \
+	"${SEND_HANGOUTS}" \
 	"${SEND_AWSSNS}" \
 	"${SEND_SYSLOG}" \
 	"${SEND_SMS}" \
-	"${SEND_MSTEAM}"; do
+	"${SEND_MSTEAM}" \
+    "${SEND_DYNATRACE}"; do
+	
 	if [ "${method}" == "YES" ]; then
 		proceed=1
 		break
@@ -680,7 +730,7 @@ date=$(date --date=@${when} "${date_format}" 2>/dev/null)
 # ----------------------------------------------------------------------------
 # prepare some extra headers if we've been asked to thread e-mails
 if [ "${SEND_EMAIL}" == "YES" ] && [ "${EMAIL_THREADING}" != "NO" ]; then
-	email_thread_headers="In-Reply-To: <${chart}-${name}@${host}>\\nReferences: <${chart}-${name}@${host}>"
+	email_thread_headers="In-Reply-To: <${chart}-${name}@${host}>\\r\\nReferences: <${chart}-${name}@${host}>"
 else
 	email_thread_headers=
 fi
@@ -840,7 +890,7 @@ send_pushover() {
 				info "sent pushover notification for: ${host} ${chart}.${name} is ${status} to '${user}'"
 				sent=$((sent + 1))
 			else
-				error "failed to send pushover notification for: ${host} ${chart}.${name} is ${status} to '${user}' with HTTP error code ${httpcode}."
+				error "failed to send pushover notification for: ${host} ${chart}.${name} is ${status} to '${user}' with HTTP response status code ${httpcode}."
 			fi
 		done
 
@@ -876,7 +926,7 @@ EOF
 				info "sent pushbullet notification for: ${host} ${chart}.${name} is ${status} to '${user}'"
 				sent=$((sent + 1))
 			else
-				error "failed to send pushbullet notification for: ${host} ${chart}.${name} is ${status} to '${user}' with HTTP error code ${httpcode}."
+				error "failed to send pushbullet notification for: ${host} ${chart}.${name} is ${status} to '${user}' with HTTP response status code ${httpcode}."
 			fi
 		done
 
@@ -900,7 +950,7 @@ send_kafka() {
 			info "sent kafka data for: ${host} ${chart}.${name} is ${status} and ip '${KAFKA_SENDER_IP}'"
 			sent=$((sent + 1))
 		else
-			error "failed to send kafka data for: ${host} ${chart}.${name} is ${status} and ip '${KAFKA_SENDER_IP}' with HTTP error code ${httpcode}."
+			error "failed to send kafka data for: ${host} ${chart}.${name} is ${status} and ip '${KAFKA_SENDER_IP}' with HTTP response status code ${httpcode}."
 		fi
 
 		[ ${sent} -gt 0 ] && return 0
@@ -957,7 +1007,7 @@ EOF
 				info "sent pagerduty notification for: ${host} ${chart}.${name} is ${status}'"
 				sent=$((sent + 1))
 			else
-				error "failed to send pagerduty notification for: ${host} ${chart}.${name} is ${status}, with HTTP error code ${httpcode}."
+				error "failed to send pagerduty notification for: ${host} ${chart}.${name} is ${status}, with HTTP response status code ${httpcode}."
 			fi
 		done
 
@@ -986,7 +1036,7 @@ send_twilio() {
 				info "sent Twilio SMS for: ${host} ${chart}.${name} is ${status} to '${user}'"
 				sent=$((sent + 1))
 			else
-				error "failed to send Twilio SMS for: ${host} ${chart}.${name} is ${status} to '${user}' with HTTP error code ${httpcode}."
+				error "failed to send Twilio SMS for: ${host} ${chart}.${name} is ${status} to '${user}' with HTTP response status code ${httpcode}."
 			fi
 		done
 
@@ -1035,7 +1085,7 @@ send_hipchat() {
 				info "sent HipChat notification for: ${host} ${chart}.${name} is ${status} to '${room}'"
 				sent=$((sent + 1))
 			else
-				error "failed to send HipChat notification for: ${host} ${chart}.${name} is ${status} to '${room}' with HTTP error code ${httpcode}."
+				error "failed to send HipChat notification for: ${host} ${chart}.${name} is ${status} to '${room}' with HTTP response status code ${httpcode}."
 			fi
 		done
 
@@ -1065,7 +1115,7 @@ send_messagebird() {
 				info "sent Messagebird SMS for: ${host} ${chart}.${name} is ${status} to '${user}'"
 				sent=$((sent + 1))
 			else
-				error "failed to send Messagebird SMS for: ${host} ${chart}.${name} is ${status} to '${user}' with HTTP error code ${httpcode}."
+				error "failed to send Messagebird SMS for: ${host} ${chart}.${name} is ${status} to '${user}' with HTTP response status code ${httpcode}."
 			fi
 		done
 
@@ -1092,7 +1142,7 @@ send_kavenegar() {
 				info "sent Kavenegar SMS for: ${host} ${chart}.${name} is ${status} to '${user}'"
 				sent=$((sent + 1))
 			else
-				error "failed to send Kavenegar SMS for: ${host} ${chart}.${name} is ${status} to '${user}' with HTTP error code ${httpcode}."
+				error "failed to send Kavenegar SMS for: ${host} ${chart}.${name} is ${status} to '${user}' with HTTP response status code ${httpcode}."
 			fi
 		done
 
@@ -1132,7 +1182,7 @@ send_telegram() {
 			elif [ "${httpcode}" = "401" ]; then
 				error "failed to send telegram notification for: ${host} ${chart}.${name} is ${status} to '${chatid}': Wrong bot token."
 			else
-				error "failed to send telegram notification for: ${host} ${chart}.${name} is ${status} to '${chatid}' with HTTP error code ${httpcode}."
+				error "failed to send telegram notification for: ${host} ${chart}.${name} is ${status} to '${chatid}' with HTTP response status code ${httpcode}."
 			fi
 		done
 
@@ -1191,7 +1241,7 @@ EOF
 			info "sent Microsoft team notification for: ${host} ${chart}.${name} is ${status} to '${webhook}'"
 			sent=$((sent + 1))
 		else
-			error "failed to send Microsoft team notification for: ${host} ${chart}.${name} is ${status} to '${webhook}', with HTTP error code ${httpcode}."
+			error "failed to send Microsoft team notification for: ${host} ${chart}.${name} is ${status} to '${webhook}', with HTTP response status code ${httpcode}."
 		fi
 	done
 
@@ -1265,7 +1315,7 @@ EOF
 			info "sent slack notification for: ${host} ${chart}.${name} is ${status} ${chstr}"
 			sent=$((sent + 1))
 		else
-			error "failed to send slack notification for: ${host} ${chart}.${name} is ${status} ${chstr}, with HTTP error code ${httpcode}."
+			error "failed to send slack notification for: ${host} ${chart}.${name} is ${status} ${chstr}, with HTTP response status code ${httpcode}."
 		fi
 	done
 
@@ -1328,7 +1378,7 @@ EOF
 			info "sent rocketchat notification for: ${host} ${chart}.${name} is ${status} to '${channel}'"
 			sent=$((sent + 1))
 		else
-			error "failed to send rocketchat notification for: ${host} ${chart}.${name} is ${status} to '${channel}', with HTTP error code ${httpcode}."
+			error "failed to send rocketchat notification for: ${host} ${chart}.${name} is ${status} to '${channel}', with HTTP response status code ${httpcode}."
 		fi
 	done
 
@@ -1400,7 +1450,7 @@ EOF
 		elif [ "${httpcode}" = "202" ]; then
 			info "suppressed alerta notification for: ${host} ${chart}.${name} is ${status} to '${channel}'"
 		else
-			error "failed to send alerta notification for: ${host} ${chart}.${name} is ${status} to '${channel}', with HTTP error code ${httpcode}."
+			error "failed to send alerta notification for: ${host} ${chart}.${name} is ${status} to '${channel}', with HTTP response status code ${httpcode}."
 		fi
 	done
 
@@ -1453,7 +1503,7 @@ send_flock() {
 			info "sent flock notification for: ${host} ${chart}.${name} is ${status} to '${channel}'"
 			sent=$((sent + 1))
 		else
-			error "failed to send flock notification for: ${host} ${chart}.${name} is ${status} to '${channel}', with HTTP error code ${httpcode}."
+			error "failed to send flock notification for: ${host} ${chart}.${name} is ${status} to '${channel}', with HTTP response status code ${httpcode}."
 		fi
 	done
 
@@ -1515,7 +1565,7 @@ EOF
 			info "sent discord notification for: ${host} ${chart}.${name} is ${status} to '${channel}'"
 			sent=$((sent + 1))
 		else
-			error "failed to send discord notification for: ${host} ${chart}.${name} is ${status} to '${channel}', with HTTP error code ${httpcode}."
+			error "failed to send discord notification for: ${host} ${chart}.${name} is ${status} to '${channel}', with HTTP response status code ${httpcode}."
 		fi
 	done
 
@@ -1544,7 +1594,7 @@ send_fleep() {
 				info "sent fleep data for: ${host} ${chart}.${name} is ${status} and user '${FLEEP_SENDER}'"
 				sent=$((sent + 1))
 			else
-				error "failed to send fleep data for: ${host} ${chart}.${name} is ${status} and user '${FLEEP_SENDER}' with HTTP error code ${httpcode}."
+				error "failed to send fleep data for: ${host} ${chart}.${name} is ${status} and user '${FLEEP_SENDER}' with HTTP response status code ${httpcode}."
 			fi
 		done
 
@@ -1612,9 +1662,10 @@ send_irc() {
 		*) color="#777777" ;;
 		esac
 
+		SNDMESSAGE="${MESSAGE//$'\n'/", "}"
 		for CHANNEL in ${CHANNELS}; do
 			error=0
-			send_alarm=$(echo -e "USER ${NICKNAME} guest ${REALNAME} ${SERVERNAME}\\nNICK ${NICKNAME}\\nJOIN ${CHANNEL}\\nPRIVMSG ${CHANNEL} :${MESSAGE}\\nQUIT\\n" \  | nc "${NETWORK}" 6667)
+			send_alarm=$(echo -e "USER ${NICKNAME} guest ${REALNAME} ${SERVERNAME}\\nNICK ${NICKNAME}\\nJOIN ${CHANNEL}\\nPRIVMSG ${CHANNEL} :${SNDMESSAGE}\\nQUIT\\n" \  | nc "${NETWORK}" 6667)
 			reply_codes=$(echo "${send_alarm}" | cut -d ' ' -f 2 | grep -o '[0-9]*')
 			for code in ${reply_codes}; do
 				if [ "${code}" -ge 400 ] && [ "${code}" -le 599 ]; then
@@ -1656,6 +1707,51 @@ send_awssns() {
 			sent=$((sent + 1))
 		else
 			error "failed to send Amazon SNS notification for: ${host} ${chart}.${name} is ${status} to '${target}'"
+		fi
+	done
+
+	[ ${sent} -gt 0 ] && return 0
+
+	return 1
+}
+
+# -----------------------------------------------------------------------------
+# Matrix sender
+
+send_matrix() {
+	local homeserver="${1}" webhook accesstoken rooms="${2}" httpcode sent=0 payload
+
+	[ "${SEND_MATRIX}" != "YES" ] && return 1
+	[ -z "${MATRIX_ACCESSTOKEN}" ] && return 1
+
+	accesstoken="${MATRIX_ACCESSTOKEN}"
+
+	case "${status}" in
+	WARNING) emoji="⚠️" ;;
+	CRITICAL) emoji="🔴" ;;
+	CLEAR) emoji="✅" ;;
+	*) emoji="⚪️" ;;
+	esac
+
+	for room in ${rooms}; do
+		webhook="$homeserver/_matrix/client/r0/rooms/$(urlencode $room)/send/m.room.message?access_token=$accesstoken"
+		payload="$(
+	cat <<EOF
+	{
+		"msgtype": "m.notice",
+		"format": "org.matrix.custom.html",
+			"formatted_body": "${emoji} ${host} ${status_message} - <b>${name//_/ }</b><br>${chart} (${family})<br><a href=\"${goto_url}\">${alarm}</a><br><i>${info}</i>",
+			"body": "${emoji} ${host} ${status_message} - ${name//_/ } ${chart} (${family}) ${goto_url} ${alarm} ${info}"
+	}
+EOF
+		)"
+
+		httpcode=$(docurl -X POST --data "${payload}" "${webhook}")
+		if [ "${httpcode}" == "200" ]; then
+			info "sent Matrix notification for: ${host} ${chart}.${name} is ${status} to '${room}'"
+			sent=$((sent + 1))
+		else
+			error "failed to send Matrix notification for: ${host} ${chart}.${name} is ${status} to '${room}', with HTTP response status code ${httpcode}."
 		fi
 	done
 
@@ -1768,6 +1864,159 @@ send_sms() {
 }
 
 # -----------------------------------------------------------------------------
+# hangouts sender
+
+send_hangouts() {
+	local rooms="${1}" httpcode sent=0 room color payload webhook
+
+	[ "${SEND_HANGOUTS}" != "YES" ] && return 1
+
+	case "${status}" in
+	WARNING) color="#ffa700" ;;
+	CRITICAL) color="#d62d20" ;;
+	CLEAR) color="#008744" ;;
+	*) color="#777777" ;;
+	esac
+
+	for room in ${rooms}; do
+		if [ -z "${HANGOUTS_WEBHOOK_URI[$room]}" ] ; then
+			info "Can't send Hangouts notification for: ${host} ${chart}.${name} to room ${room}. HANGOUTS_WEBHOOK_URI[$room] not defined"
+		else
+			webhook="${HANGOUTS_WEBHOOK_URI[$room]}"
+			payload="$(
+				cat <<EOF
+				{
+					"cards": [
+						{
+							"header": {
+								"title": "Netdata on ${host}",
+								"imageUrl": "${images_base_url}/images/banner-icon-144x144.png",
+								"imageStyle": "IMAGE"
+							},
+							"sections": [
+								{
+									"header": "<b>${host}</b>",
+									"widgets": [
+										{
+											"keyValue": {
+												"topLabel": "Status Message",
+												"content": "<b>${status_message}</b>",
+												"contentMultiline": "true",
+												"iconUrl": "${image}",
+												"onClick": {
+													"openLink": {
+														"url": "${goto_url}"
+													}
+												}
+											}
+										},
+										{
+											"keyValue": {
+												"topLabel": "${chart} | ${family}",
+												"content": "<font color=${color}>${alarm}</font>",
+												"contentMultiline": "true"
+											}
+										}
+									]
+								},
+								{
+									"widgets": [
+										{
+											"textParagraph": {
+											"text": "<font color=\"#0057e7\">@ ${date}\n<b>${info}</b></font>"
+											}
+										}
+									]
+								},
+								{
+									"widgets": [
+										{
+											"buttons": [
+												{
+													"textButton": {
+														"text": "Go to ${host}",
+														"onClick": {
+															"openLink": {
+																"url": "${goto_url}"
+															}
+														}
+													}
+												}
+											]
+										}
+									]
+								}
+							]
+						}
+					]
+				}
+EOF
+				)"
+
+			httpcode=$(docurl -H "Content-Type: application/json" -X POST -d "${payload}" "${webhook}")
+
+			if [ "${httpcode}" = "200" ]; then
+				info "sent hangouts notification for: ${host} ${chart}.${name} is ${status} to '${room}'"
+				sent=$((sent + 1))
+			else
+				error "failed to send hangouts notification for: ${host} ${chart}.${name} is ${status} to '${room}', with HTTP response status code ${httpcode}."
+			fi
+		fi
+	done
+
+	[ ${sent} -gt 0 ] && return 0
+
+	return 1
+}
+# -----------------------------------------------------------------------------
+# Dynatrace sender
+send_dynatrace() {
+  [ "${SEND_DYNATRACE}" != "YES" ] && return 1
+
+  local dynatrace_url="${DYNATRACE_SERVER}/e/${DYNATRACE_SPACE}/api/v1/events"
+  local description="NetData Notification for: ${host} ${chart}.${name} is ${status}"
+  local payload=""
+  
+  payload=$(cat <<EOF
+{
+  "title": "NetData Alarm from ${host}",
+  "source" : "${DYNATRACE_ANNOTATION_TYPE}",
+  "description" : "${description}",
+  "eventType": "${DYNATRACE_EVENT}",
+   "attachRules":{
+     "tagRule":[{
+        "meTypes":["HOST"],
+        "tags":["${DYNATRACE_TAG_VALUE}"]
+     }]
+  },
+  "customProperties":{
+    "description": "${description}"
+  }
+}
+EOF
+)
+
+  # echo ${payload}
+
+  httpcode=$(docurl -X POST  -H "Authorization: Api-token ${DYNATRACE_TOKEN}"  -H "Content-Type: application/json" -d "${payload}"    ${dynatrace_url})
+  ret=$?
+
+
+  if [ ${ret} -eq 0 ]; then
+     if [ "${httpcode}" = "200" ]; then
+        info "sent ${DYNATRACE_EVENT} to ${DYNATRACE_SERVER}"
+        return 0
+     else
+        warning "Dynatrace ${DYNATRACE_SERVER} responded ${httpcode} notification for: ${host} ${chart}.${name} is ${status} was not sent!"
+        return 1
+     fi
+  else
+     error  "failed to sent ${DYNATRACE_EVENT} notification for: ${host} ${chart}.${name} is ${status} to  ${DYNATRACE_SERVER} with error code ${ret}."
+     return 1
+  fi
+}
+
+# -----------------------------------------------------------------------------
 # prepare the content of the notification
 
 # the url to send the user on click
@@ -1780,7 +2029,7 @@ url_family="${REPLY}"
 urlencode "${name}" >/dev/null
 url_name="${REPLY}"
 
-redirect_params="host=${url_host}&chart=${url_chart}&family=${url_family}&alarm=${url_name}&alarm_unique_id=${unique_id}&alarm_id=${alarm_id}&alarm_event_id=${event_id}"
+redirect_params="host=${url_host}&chart=${url_chart}&family=${url_family}&alarm=${url_name}&alarm_unique_id=${unique_id}&alarm_id=${alarm_id}&alarm_event_id=${event_id}&alarm_when=${when}"
 GOTOCLOUD=0
 
 if [ "${NETDATA_REGISTRY_URL}" == "https://registry.my-netdata.io" ]; then
@@ -1789,7 +2038,7 @@ if [ "${NETDATA_REGISTRY_URL}" == "https://registry.my-netdata.io" ]; then
 			NETDATA_REGISTRY_UNIQUE_ID="$(cat "@registrydir_POST@/netdata.public.unique.id")"
 		fi
 	fi
-	if [ ! -z "${NETDATA_REGISTRY_UNIQUE_ID}" ]; then
+	if [ -n "${NETDATA_REGISTRY_UNIQUE_ID}" ]; then
 		GOTOCLOUD=1
 	fi
 fi
@@ -1797,7 +2046,9 @@ fi
 if [ ${GOTOCLOUD} -eq 0 ]; then
 	goto_url="${NETDATA_REGISTRY_URL}/goto-host-from-alarm.html?${redirect_params}"
 else
-	goto_url="https://netdata.cloud/alarms/redirect?agentID=${NETDATA_REGISTRY_UNIQUE_ID}&${redirect_params}"
+	# Temporarily disable alarm redirection, as the cloud endpoint no longer exists. This functionality will be restored after discussion on #9487. For now, just lead to netdata.cloud
+	#goto_url="${NETDATA_REGISTRY_CLOUD_BASE_URL}/alarms/redirect?agentID=${NETDATA_REGISTRY_UNIQUE_ID}&${redirect_params}"
+	goto_url="${NETDATA_REGISTRY_CLOUD_BASE_URL}"
 fi
 
 # the severity of the alarm
@@ -1886,6 +2137,15 @@ send_slack "${SLACK_WEBHOOK_URL}" "${to_slack}"
 SENT_SLACK=$?
 
 # -----------------------------------------------------------------------------
+# send the hangouts notification
+
+# hangouts aggregates posts from the same room
+# so we use "${host} ${status}" as the room, to make them diff
+
+send_hangouts "${to_hangouts}"
+SENT_HANGOUTS=$?
+
+# -----------------------------------------------------------------------------
 # send the Microsoft notification
 
 # Microsoft team aggregates posts from the same username
@@ -1952,7 +2212,7 @@ send_pushbullet "${PUSHBULLET_ACCESS_TOKEN}" "${PUSHBULLET_SOURCE_DEVICE}" "${to
 Severity: ${severity}\\n
 Chart: ${chart}\\n
 Family: ${family}\\n
-$(date -d @${when})\\n
+${date}\\n
 The source of this alarm is line ${src}"
 
 SENT_PUSHBULLET=$?
@@ -2082,6 +2342,13 @@ send_awssns "${to_awssns}"
 SENT_AWSSNS=$?
 
 # -----------------------------------------------------------------------------
+#  send the Matrix message
+send_matrix "${MATRIX_HOMESERVER}" "${to_matrix}"
+
+SENT_MATRIX=$?
+
+
+# -----------------------------------------------------------------------------
 # send the syslog message
 
 send_syslog "${to_syslog}"
@@ -2091,16 +2358,7 @@ SENT_SYSLOG=$?
 # -----------------------------------------------------------------------------
 # send the email
 
-send_email <<EOF
-To: ${to_email}
-Subject: ${host} ${status_message} - ${name//_/ } - ${chart}
-MIME-Version: 1.0
-Content-Type: multipart/alternative; boundary="multipart-boundary"
-${email_thread_headers}
-
-This is a MIME-encoded multipart message
-
---multipart-boundary
+IFS='' read -r -d '' email_plaintext_part <<EOF
 Content-Type: text/plain; encoding=${EMAIL_CHARSET}
 Content-Disposition: inline
 Content-Transfer-Encoding: 8bit
@@ -2122,8 +2380,27 @@ Evaluated Expression :  ${calc_expression}
 Expression Variables :  ${calc_param_values}
 
 The host has ${total_warnings} WARNING and ${total_critical} CRITICAL alarm(s) raised.
+EOF
+
+if [[ "${EMAIL_PLAINTEXT_ONLY}" == "YES" ]]; then
+
+send_email <<EOF
+To: ${to_email}
+Subject: ${host} ${status_message} - ${name//_/ } - ${chart}
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="multipart-boundary"
+${email_thread_headers}
+
+This is a MIME-encoded multipart message
 
 --multipart-boundary
+${email_plaintext_part}
+--multipart-boundary--
+EOF
+
+else
+
+IFS='' read -r -d '' email_html_part <<EOF
 Content-Type: text/html; encoding=${EMAIL_CHARSET}
 Content-Disposition: inline
 Content-Transfer-Encoding: 8bit
@@ -2229,10 +2506,33 @@ Content-Transfer-Encoding: 8bit
 </table>
 </body>
 </html>
+EOF
+
+send_email <<EOF
+To: ${to_email}
+Subject: ${host} ${status_message} - ${name//_/ } - ${chart}
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="multipart-boundary"
+${email_thread_headers}
+
+This is a MIME-encoded multipart message
+
+--multipart-boundary
+${email_plaintext_part}
+--multipart-boundary
+${email_html_part}
 --multipart-boundary--
 EOF
 
+fi
+
 SENT_EMAIL=$?
+
+# -----------------------------------------------------------------------------
+# send the EVENT to Dynatrace
+send_dynatrace "${host}" "${chart}" "${name}"  "${status}"
+SENT_DYNATRACE=$?
+
 
 # -----------------------------------------------------------------------------
 # let netdata know
@@ -2240,6 +2540,7 @@ for state in "${SENT_EMAIL}" \
 	"${SENT_PUSHOVER}" \
 	"${SENT_TELEGRAM}" \
 	"${SENT_SLACK}" \
+	"${SENT_HANGOUTS}" \
 	"${SENT_ROCKETCHAT}" \
 	"${SENT_ALERTA}" \
 	"${SENT_FLOCK}" \
@@ -2256,9 +2557,11 @@ for state in "${SENT_EMAIL}" \
 	"${SENT_CUSTOM}" \
 	"${SENT_IRC}" \
 	"${SENT_AWSSNS}" \
+	"${SENT_MATRIX}" \
 	"${SENT_SYSLOG}" \
 	"${SENT_SMS}" \
-	"${SENT_MSTEAM}"; do
+	"${SENT_MSTEAM}" \
+    "${SENT_DYNATRACE}"; do	
 	if [ "${state}" -eq 0 ]; then
 		# we sent something
 		exit 0

@@ -1,5 +1,5 @@
-#!/bin/bash
-# Cross-arch docker build helper script
+#!/usr/bin/env bash
+#
 #
 # Copyright: SPDX-License-Identifier: GPL-3.0-or-later
 #
@@ -14,15 +14,25 @@ if [ "${BASH_VERSINFO[0]}" -lt "4" ]; then
 fi
 
 VERSION="$1"
-REPOSITORY="${REPOSITORY:-netdata}"
-declare -A ARCH_MAP
-ARCH_MAP=(["i386"]="386" ["amd64"]="amd64" ["armhf"]="arm" ["aarch64"]="arm64")
-DEVEL_ARCHS=(amd64)
-ARCHS="${!ARCH_MAP[@]}"
 
-# When development mode is set, build on DEVEL_ARCHS
-if [ ! -z ${DEVEL+x} ]; then
-    declare -a ARCHS=(${DEVEL_ARCHS[@]})
+if [ -z "${ARCH}" ]; then
+  echo "ARCH not set, build cannot proceed"
+  exit 1
+fi
+
+if [ "${RELEASE_CHANNEL}" != "nightly" ] && [ "${RELEASE_CHANNEL}" != "stable" ]; then
+  echo "RELEASE_CHANNEL must be set to either 'nightly' or 'stable' - build cannot proceed"
+  exit 1
+fi
+
+if [ -z ${REPOSITORY} ]; then
+	REPOSITORY="${TRAVIS_REPO_SLUG}"
+	if [ -z ${REPOSITORY} ]; then
+		echo "REPOSITORY not set, build cannot proceed"
+		exit 1
+	else
+		echo "REPOSITORY was not detected, attempted to use TRAVIS_REPO_SLUG setting: ${TRAVIS_REPO_SLUG}"
+	fi
 fi
 
 # Ensure there is a version, the most appropriate one
@@ -43,21 +53,20 @@ if [ ! -z $CWD ] || [ ! "${TOP_LEVEL}" == "netdata" ]; then
 fi
 
 echo "Docker image build in progress.."
-echo "Version       : ${VERSION}"
-echo "Repository    : ${REPOSITORY}"
-echo "Architectures : ${ARCHS[*]}"
+echo "Version     : ${VERSION}"
+echo "Repository  : ${REPOSITORY}"
+echo "Architecture: ${ARCH}"
 
 docker run --rm --privileged multiarch/qemu-user-static:register --reset
 
 # Build images using multi-arch Dockerfile.
-for ARCH in ${ARCHS[@]}; do
-     TAG="${REPOSITORY}:${VERSION}-${ARCH}"
-     echo "Building tag ${TAG}.."
-     eval docker build \
-          --build-arg ARCH="${ARCH}" \
-          --tag "${TAG}" \
-          --file packaging/docker/Dockerfile ./
-     echo "..Done!"
-done
+TAG="${REPOSITORY,,}:${VERSION}-${ARCH}"
+echo "Building tag ${TAG}.."
+docker build --no-cache                                  \
+	--build-arg ARCH="${ARCH}"                       \
+	--build-arg RELEASE_CHANNEL="${RELEASE_CHANNEL}" \
+	--tag "${TAG}"                                   \
+	--file packaging/docker/Dockerfile .
+echo "..Done!"
 
 echo "Docker build process completed!"

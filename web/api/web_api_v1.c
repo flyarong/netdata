@@ -2,6 +2,8 @@
 
 #include "web_api_v1.h"
 
+char *api_secret;
+
 static struct {
     const char *name;
     uint32_t hash;
@@ -32,6 +34,7 @@ static struct {
         , {"match-ids"       , 0    , RRDR_OPTION_MATCH_IDS}
         , {"match_names"     , 0    , RRDR_OPTION_MATCH_NAMES}
         , {"match-names"     , 0    , RRDR_OPTION_MATCH_NAMES}
+        , {"showcustomvars"  , 0    , RRDR_OPTION_CUSTOM_VARS}
         , {                  NULL, 0, 0}
 };
 
@@ -193,10 +196,8 @@ inline uint32_t web_client_api_request_v1_data_google_format(char *name) {
     return DATASOURCE_JSON;
 }
 
-
-inline int web_client_api_request_v1_alarms(RRDHOST *host, struct web_client *w, char *url) {
+int web_client_api_request_v1_alarms_select (char *url) {
     int all = 0;
-
     while(url) {
         char *value = mystrsep(&url, "&");
         if (!value || !*value) continue;
@@ -205,9 +206,70 @@ inline int web_client_api_request_v1_alarms(RRDHOST *host, struct web_client *w,
         else if(!strcmp(value, "active")) all = 0;
     }
 
+    return all;
+}
+
+inline int web_client_api_request_v1_alarms(RRDHOST *host, struct web_client *w, char *url) {
+    int all = web_client_api_request_v1_alarms_select(url);
+
     buffer_flush(w->response.data);
     w->response.data->contenttype = CT_APPLICATION_JSON;
     health_alarms2json(host, w->response.data, all);
+    buffer_no_cacheable(w->response.data);
+    return HTTP_RESP_OK;
+}
+
+inline int web_client_api_request_v1_alarms_values(RRDHOST *host, struct web_client *w, char *url) {
+    int all = web_client_api_request_v1_alarms_select(url);
+
+    buffer_flush(w->response.data);
+    w->response.data->contenttype = CT_APPLICATION_JSON;
+    health_alarms_values2json(host, w->response.data, all);
+    buffer_no_cacheable(w->response.data);
+    return HTTP_RESP_OK;
+}
+
+inline int web_client_api_request_v1_alarm_count(RRDHOST *host, struct web_client *w, char *url) {
+    RRDCALC_STATUS status = RRDCALC_STATUS_RAISED;
+    BUFFER *contexts = NULL;
+
+    buffer_flush(w->response.data);
+    buffer_sprintf(w->response.data, "[");
+
+    while(url) {
+        char *value = mystrsep(&url, "&");
+        if(!value || !*value) continue;
+
+        char *name = mystrsep(&value, "=");
+        if(!name || !*name) continue;
+        if(!value || !*value) continue;
+
+        debug(D_WEB_CLIENT, "%llu: API v1 alarm_count query param '%s' with value '%s'", w->id, name, value);
+
+        char* p = value;
+        if(!strcmp(name, "status")) {
+            while ((*p = toupper(*p))) p++;
+            if (!strcmp("CRITICAL", value)) status = RRDCALC_STATUS_CRITICAL;
+            else if (!strcmp("WARNING", value)) status = RRDCALC_STATUS_WARNING;
+            else if (!strcmp("UNINITIALIZED", value)) status = RRDCALC_STATUS_UNINITIALIZED;
+            else if (!strcmp("UNDEFINED", value)) status = RRDCALC_STATUS_UNDEFINED;
+            else if (!strcmp("REMOVED", value)) status = RRDCALC_STATUS_REMOVED;
+            else if (!strcmp("CLEAR", value)) status = RRDCALC_STATUS_CLEAR;
+        }
+        else if(!strcmp(name, "context") || !strcmp(name, "ctx")) {
+            if(!contexts) contexts = buffer_create(255);
+            buffer_strcat(contexts, "|");
+            buffer_strcat(contexts, value);
+        }
+    }
+
+    health_aggregate_alarms(host, w->response.data, contexts, status);
+
+    buffer_sprintf(w->response.data, "]\n");
+    w->response.data->contenttype = CT_APPLICATION_JSON;
+    buffer_no_cacheable(w->response.data);
+
+    buffer_free(contexts);
     return 200;
 }
 
@@ -228,11 +290,11 @@ inline int web_client_api_request_v1_alarm_log(RRDHOST *host, struct web_client 
     buffer_flush(w->response.data);
     w->response.data->contenttype = CT_APPLICATION_JSON;
     health_alarm_log2json(host, w->response.data, after);
-    return 200;
+    return HTTP_RESP_OK;
 }
 
 inline int web_client_api_request_single_chart(RRDHOST *host, struct web_client *w, char *url, void callback(RRDSET *st, BUFFER *buf)) {
-    int ret = 400;
+    int ret = HTTP_RESP_BAD_REQUEST;
     char *chart = NULL;
 
     buffer_flush(w->response.data);
@@ -265,14 +327,14 @@ inline int web_client_api_request_single_chart(RRDHOST *host, struct web_client 
     if(!st) {
         buffer_strcat(w->response.data, "Chart is not found: ");
         buffer_strcat_htmlescape(w->response.data, chart);
-        ret = 404;
+        ret = HTTP_RESP_NOT_FOUND;
         goto cleanup;
     }
 
     w->response.data->contenttype = CT_APPLICATION_JSON;
     st->last_accessed_time = now_realtime_sec();
     callback(st, w->response.data);
-    return 200;
+    return HTTP_RESP_OK;
 
     cleanup:
     return ret;
@@ -287,8 +349,17 @@ inline int web_client_api_request_v1_charts(RRDHOST *host, struct web_client *w,
 
     buffer_flush(w->response.data);
     w->response.data->contenttype = CT_APPLICATION_JSON;
-    charts2json(host, w->response.data);
-    return 200;
+    charts2json(host, w->response.data, 0, 0);
+    return HTTP_RESP_OK;
+}
+
+inline int web_client_api_request_v1_archivedcharts(RRDHOST *host, struct web_client *w, char *url) {
+    (void)url;
+
+    buffer_flush(w->response.data);
+    w->response.data->contenttype = CT_APPLICATION_JSON;
+    charts2json(host, w->response.data, 0, 1);
+    return HTTP_RESP_OK;
 }
 
 inline int web_client_api_request_v1_chart(RRDHOST *host, struct web_client *w, char *url) {
@@ -308,7 +379,7 @@ void fix_google_param(char *s) {
 inline int web_client_api_request_v1_data(RRDHOST *host, struct web_client *w, char *url) {
     debug(D_WEB_CLIENT, "%llu: API v1 data with URL '%s'", w->id, url);
 
-    int ret = 400;
+    int ret = HTTP_RESP_BAD_REQUEST;
     BUFFER *dimensions = NULL;
 
     buffer_flush(w->response.data);
@@ -421,13 +492,13 @@ inline int web_client_api_request_v1_data(RRDHOST *host, struct web_client *w, c
     if(!st) {
         buffer_strcat(w->response.data, "Chart is not found: ");
         buffer_strcat_htmlescape(w->response.data, chart);
-        ret = 404;
+        ret = HTTP_RESP_NOT_FOUND;
         goto cleanup;
     }
     st->last_accessed_time = now_realtime_sec();
 
     long long before = (before_str && *before_str)?str2l(before_str):0;
-    long long after  = (after_str  && *after_str) ?str2l(after_str):0;
+    long long after  = (after_str  && *after_str) ?str2l(after_str):-600;
     int       points = (points_str && *points_str)?str2i(points_str):0;
     long      group_time = (group_time_str && *group_time_str)?str2l(group_time_str):0;
 
@@ -608,7 +679,7 @@ inline int web_client_api_request_v1_registry(RRDHOST *host, struct web_client *
     if(unlikely(respect_web_browser_do_not_track_policy && web_client_has_donottrack(w))) {
         buffer_flush(w->response.data);
         buffer_sprintf(w->response.data, "Your web browser is sending 'DNT: 1' (Do Not Track). The registry requires persistent cookies on your browser to work.");
-        return 400;
+        return HTTP_RESP_BAD_REQUEST;
     }
 
     if(unlikely(action == 'H')) {
@@ -628,7 +699,7 @@ inline int web_client_api_request_v1_registry(RRDHOST *host, struct web_client *
                 error("Invalid registry request - access requires these parameters: machine ('%s'), url ('%s'), name ('%s')", machine_guid ? machine_guid : "UNSET", machine_url ? machine_url : "UNSET", url_name ? url_name : "UNSET");
                 buffer_flush(w->response.data);
                 buffer_strcat(w->response.data, "Invalid registry Access request.");
-                return 400;
+                return HTTP_RESP_BAD_REQUEST;
             }
 
             web_client_enable_tracking_required(w);
@@ -639,7 +710,7 @@ inline int web_client_api_request_v1_registry(RRDHOST *host, struct web_client *
                 error("Invalid registry request - delete requires these parameters: machine ('%s'), url ('%s'), delete_url ('%s')", machine_guid?machine_guid:"UNSET", machine_url?machine_url:"UNSET", delete_url?delete_url:"UNSET");
                 buffer_flush(w->response.data);
                 buffer_strcat(w->response.data, "Invalid registry Delete request.");
-                return 400;
+                return HTTP_RESP_BAD_REQUEST;
             }
 
             web_client_enable_tracking_required(w);
@@ -650,7 +721,7 @@ inline int web_client_api_request_v1_registry(RRDHOST *host, struct web_client *
                 error("Invalid registry request - search requires these parameters: machine ('%s'), url ('%s'), for ('%s')", machine_guid?machine_guid:"UNSET", machine_url?machine_url:"UNSET", search_machine_guid?search_machine_guid:"UNSET");
                 buffer_flush(w->response.data);
                 buffer_strcat(w->response.data, "Invalid registry Search request.");
-                return 400;
+                return HTTP_RESP_BAD_REQUEST;
             }
 
             web_client_enable_tracking_required(w);
@@ -661,7 +732,7 @@ inline int web_client_api_request_v1_registry(RRDHOST *host, struct web_client *
                 error("Invalid registry request - switching identity requires these parameters: machine ('%s'), url ('%s'), to ('%s')", machine_guid?machine_guid:"UNSET", machine_url?machine_url:"UNSET", to_person_guid?to_person_guid:"UNSET");
                 buffer_flush(w->response.data);
                 buffer_strcat(w->response.data, "Invalid registry Switch request.");
-                return 400;
+                return HTTP_RESP_BAD_REQUEST;
             }
 
             web_client_enable_tracking_required(w);
@@ -673,7 +744,7 @@ inline int web_client_api_request_v1_registry(RRDHOST *host, struct web_client *
         default:
             buffer_flush(w->response.data);
             buffer_strcat(w->response.data, "Invalid registry request - you need to set an action: hello, access, delete, search");
-            return 400;
+            return HTTP_RESP_BAD_REQUEST;
     }
 }
 
@@ -703,39 +774,174 @@ static inline void web_client_api_request_v1_info_summary_alarm_statuses(RRDHOST
 }
 
 static inline void web_client_api_request_v1_info_mirrored_hosts(BUFFER *wb) {
-    RRDHOST *rc;
+    RRDHOST *host;
     int count = 0;
+
+    buffer_strcat(wb, "\t\"mirrored_hosts\": [\n");
     rrd_rdlock();
-    rrdhost_foreach_read(rc) {
+    rrdhost_foreach_read(host) {
+        if (rrdhost_flag_check(host, RRDHOST_FLAG_ARCHIVED))
+            continue;
+        if (count > 0)
+            buffer_strcat(wb, ",\n");
+
+        buffer_sprintf(wb, "\t\t\"%s\"", host->hostname);
+        count++;
+    }
+
+    buffer_strcat(wb, "\n\t],\n\t\"mirrored_hosts_status\": [\n");
+    count = 0;
+    rrdhost_foreach_read(host)
+    {
+        if (rrdhost_flag_check(host, RRDHOST_FLAG_ARCHIVED))
+            continue;
+        if (count > 0)
+            buffer_strcat(wb, ",\n");
+
+        netdata_mutex_lock(&host->receiver_lock);
+        buffer_sprintf(
+            wb, "\t\t{ \"guid\": \"%s\", \"reachable\": %s, \"claim_id\": ", host->machine_guid,
+            (host->receiver || host == localhost) ? "true" : "false");
+        netdata_mutex_unlock(&host->receiver_lock);
+
+        netdata_mutex_lock(&host->claimed_id_lock);
+        if (host->claimed_id)
+            buffer_sprintf(wb, "\"%s\" }", host->claimed_id);
+        else
+            buffer_strcat(wb, "null }");
+        netdata_mutex_unlock(&host->claimed_id_lock);
+
+        count++;
+    }
+    rrd_unlock();
+
+    buffer_strcat(wb, "\n\t],\n");
+}
+
+inline void host_labels2json(RRDHOST *host, BUFFER *wb, size_t indentation) {
+    char tabs[11];
+
+    if (indentation > 10)
+        indentation = 10;
+
+    tabs[0] = '\0';
+    while (indentation) {
+        strcat(tabs, "\t");
+        indentation--;
+    }
+
+    int count = 0;
+    rrdhost_rdlock(host);
+    netdata_rwlock_rdlock(&host->labels_rwlock);
+    for (struct label *label = host->labels; label; label = label->next) {
         if(count > 0) buffer_strcat(wb, ",\n");
-        buffer_sprintf(wb, "\t\t\"%s\"", rc->hostname);
+        buffer_strcat(wb, tabs);
+
+        char value[CONFIG_MAX_VALUE * 2 + 1];
+        sanitize_json_string(value, label->value, CONFIG_MAX_VALUE * 2);
+        buffer_sprintf(wb, "\"%s\": \"%s\"", label->key, value);
+
         count++;
     }
     buffer_strcat(wb, "\n");
-    rrd_unlock();
+    netdata_rwlock_unlock(&host->labels_rwlock);
+    rrdhost_unlock(host);
 }
 
-inline int web_client_api_request_v1_info(RRDHOST *host, struct web_client *w, char *url) {
-    (void)url;
-
-    BUFFER *wb = w->response.data;
-    buffer_flush(wb);
-    wb->contenttype = CT_APPLICATION_JSON;
-
+extern int aclk_connected;
+inline int web_client_api_request_v1_info_fill_buffer(RRDHOST *host, BUFFER *wb)
+{
     buffer_strcat(wb, "{\n");
     buffer_sprintf(wb, "\t\"version\": \"%s\",\n", host->program_version);
     buffer_sprintf(wb, "\t\"uid\": \"%s\",\n", host->machine_guid);
 
-    buffer_strcat(wb, "\t\"mirrored_hosts\": [\n");
     web_client_api_request_v1_info_mirrored_hosts(wb);
-    buffer_strcat(wb, "\t],\n");
 
     buffer_strcat(wb, "\t\"alarms\": {\n");
     web_client_api_request_v1_info_summary_alarm_statuses(host, wb);
-    buffer_strcat(wb, "\t}\n");
+    buffer_strcat(wb, "\t},\n");
+
+    buffer_sprintf(wb, "\t\"os_name\": \"%s\",\n", (host->system_info->host_os_name) ? host->system_info->host_os_name : "");
+    buffer_sprintf(wb, "\t\"os_id\": \"%s\",\n", (host->system_info->host_os_id) ? host->system_info->host_os_id : "");
+    buffer_sprintf(wb, "\t\"os_id_like\": \"%s\",\n", (host->system_info->host_os_id_like) ? host->system_info->host_os_id_like : "");
+    buffer_sprintf(wb, "\t\"os_version\": \"%s\",\n", (host->system_info->host_os_version) ? host->system_info->host_os_version : "");
+    buffer_sprintf(wb, "\t\"os_version_id\": \"%s\",\n", (host->system_info->host_os_version_id) ? host->system_info->host_os_version_id : "");
+    buffer_sprintf(wb, "\t\"os_detection\": \"%s\",\n", (host->system_info->host_os_detection) ? host->system_info->host_os_detection : "");
+    buffer_sprintf(wb, "\t\"cores_total\": \"%s\",\n", (host->system_info->host_cores) ? host->system_info->host_cores : "");
+    buffer_sprintf(wb, "\t\"total_disk_space\": \"%s\",\n", (host->system_info->host_disk_space) ? host->system_info->host_disk_space : "");
+    buffer_sprintf(wb, "\t\"cpu_freq\": \"%s\",\n", (host->system_info->host_cpu_freq) ? host->system_info->host_cpu_freq : "");
+    buffer_sprintf(wb, "\t\"ram_total\": \"%s\",\n", (host->system_info->host_ram_total) ? host->system_info->host_ram_total : "");
+
+    if (host->system_info->container_os_name)
+        buffer_sprintf(wb, "\t\"container_os_name\": \"%s\",\n", host->system_info->container_os_name);
+    if (host->system_info->container_os_id)
+        buffer_sprintf(wb, "\t\"container_os_id\": \"%s\",\n", host->system_info->container_os_id);
+    if (host->system_info->container_os_id_like)
+        buffer_sprintf(wb, "\t\"container_os_id_like\": \"%s\",\n", host->system_info->container_os_id_like);
+    if (host->system_info->container_os_version)
+        buffer_sprintf(wb, "\t\"container_os_version\": \"%s\",\n", host->system_info->container_os_version);
+    if (host->system_info->container_os_version_id)
+        buffer_sprintf(wb, "\t\"container_os_version_id\": \"%s\",\n", host->system_info->container_os_version_id);
+    if (host->system_info->container_os_detection)
+        buffer_sprintf(wb, "\t\"container_os_detection\": \"%s\",\n", host->system_info->container_os_detection);
+
+    buffer_sprintf(wb, "\t\"kernel_name\": \"%s\",\n", (host->system_info->kernel_name) ? host->system_info->kernel_name : "");
+    buffer_sprintf(wb, "\t\"kernel_version\": \"%s\",\n", (host->system_info->kernel_version) ? host->system_info->kernel_version : "");
+    buffer_sprintf(wb, "\t\"architecture\": \"%s\",\n", (host->system_info->architecture) ? host->system_info->architecture : "");
+    buffer_sprintf(wb, "\t\"virtualization\": \"%s\",\n", (host->system_info->virtualization) ? host->system_info->virtualization : "");
+    buffer_sprintf(wb, "\t\"virt_detection\": \"%s\",\n", (host->system_info->virt_detection) ? host->system_info->virt_detection : "");
+    buffer_sprintf(wb, "\t\"container\": \"%s\",\n", (host->system_info->container) ? host->system_info->container : "");
+    buffer_sprintf(wb, "\t\"container_detection\": \"%s\",\n", (host->system_info->container_detection) ? host->system_info->container_detection : "");
+
+    buffer_strcat(wb, "\t\"host_labels\": {\n");
+    host_labels2json(host, wb, 2);
+    buffer_strcat(wb, "\t},\n");
+
+    buffer_strcat(wb, "\t\"collectors\": [");
+    chartcollectors2json(host, wb);
+    buffer_strcat(wb, "\n\t],\n");
+
+#ifdef DISABLE_CLOUD
+    buffer_strcat(wb, "\t\"cloud-enabled\": false,\n");
+#else
+    buffer_sprintf(wb, "\t\"cloud-enabled\": %s,\n",
+                   appconfig_get_boolean(&cloud_config, CONFIG_SECTION_GLOBAL, "enabled", 1) ? "true" : "false");
+#endif
+
+#ifdef ENABLE_ACLK
+    buffer_strcat(wb, "\t\"cloud-available\": true,\n");
+#else
+    buffer_strcat(wb, "\t\"cloud-available\": false,\n");
+#endif
+    char *agent_id = is_agent_claimed();
+    if (agent_id == NULL)
+        buffer_strcat(wb, "\t\"agent-claimed\": false,\n");
+    else {
+        buffer_strcat(wb, "\t\"agent-claimed\": true,\n");
+        freez(agent_id);
+    }
+#ifdef ENABLE_ACLK
+    if (aclk_connected)
+        buffer_strcat(wb, "\t\"aclk-available\": true\n");
+    else
+#endif
+        buffer_strcat(wb, "\t\"aclk-available\": false\n");     // Intentionally valid with/without #ifdef above
 
     buffer_strcat(wb, "}");
-    return 200;
+    return 0;
+}
+
+inline int web_client_api_request_v1_info(RRDHOST *host, struct web_client *w, char *url) {
+    (void)url;
+    if (!netdata_ready) return HTTP_RESP_BACKEND_FETCH_FAILED;
+    BUFFER *wb = w->response.data;
+    buffer_flush(wb);
+    wb->contenttype = CT_APPLICATION_JSON;
+
+    web_client_api_request_v1_info_fill_buffer(host, wb);
+
+    buffer_no_cacheable(wb);
+    return HTTP_RESP_OK;
 }
 
 static struct api_command {
@@ -748,6 +954,7 @@ static struct api_command {
         { "data",            0, WEB_CLIENT_ACL_DASHBOARD, web_client_api_request_v1_data            },
         { "chart",           0, WEB_CLIENT_ACL_DASHBOARD, web_client_api_request_v1_chart           },
         { "charts",          0, WEB_CLIENT_ACL_DASHBOARD, web_client_api_request_v1_charts          },
+        { "archivedcharts",  0, WEB_CLIENT_ACL_DASHBOARD, web_client_api_request_v1_archivedcharts  },
 
         // registry checks the ACL by itself, so we allow everything
         { "registry",        0, WEB_CLIENT_ACL_NOCHECK,   web_client_api_request_v1_registry        },
@@ -756,8 +963,10 @@ static struct api_command {
         { "badge.svg",       0, WEB_CLIENT_ACL_DASHBOARD|WEB_CLIENT_ACL_BADGE, web_client_api_request_v1_badge },
 
         { "alarms",          0, WEB_CLIENT_ACL_DASHBOARD, web_client_api_request_v1_alarms          },
+        { "alarms_values",   0, WEB_CLIENT_ACL_DASHBOARD, web_client_api_request_v1_alarms_values   },
         { "alarm_log",       0, WEB_CLIENT_ACL_DASHBOARD, web_client_api_request_v1_alarm_log       },
         { "alarm_variables", 0, WEB_CLIENT_ACL_DASHBOARD, web_client_api_request_v1_alarm_variables },
+        { "alarm_count",     0, WEB_CLIENT_ACL_DASHBOARD, web_client_api_request_v1_alarm_count     },
         { "allmetrics",      0, WEB_CLIENT_ACL_DASHBOARD, web_client_api_request_v1_allmetrics      },
         { "manage/health",   0, WEB_CLIENT_ACL_MGMT,      web_client_api_request_v1_mgmt_health     },
         // terminator
@@ -776,28 +985,28 @@ inline int web_client_api_request_v1(RRDHOST *host, struct web_client *w, char *
     }
 
     // get the command
-    char *tok = mystrsep(&url, "?");
-    if(tok && *tok) {
-        debug(D_WEB_CLIENT, "%llu: Searching for API v1 command '%s'.", w->id, tok);
-        uint32_t hash = simple_hash(tok);
+    if(url) {
+        debug(D_WEB_CLIENT, "%llu: Searching for API v1 command '%s'.", w->id, url);
+        uint32_t hash = simple_hash(url);
 
         for(i = 0; api_commands[i].command ;i++) {
-            if(unlikely(hash == api_commands[i].hash && !strcmp(tok, api_commands[i].command))) {
+            if(unlikely(hash == api_commands[i].hash && !strcmp(url, api_commands[i].command))) {
                 if(unlikely(api_commands[i].acl != WEB_CLIENT_ACL_NOCHECK) &&  !(w->acl & api_commands[i].acl))
                     return web_client_permission_denied(w);
 
-                return api_commands[i].callback(host, w, url);
+                //return api_commands[i].callback(host, w, url);
+                return api_commands[i].callback(host, w, (w->decoded_query_string + 1));
             }
         }
 
         buffer_flush(w->response.data);
         buffer_strcat(w->response.data, "Unsupported v1 API command: ");
-        buffer_strcat_htmlescape(w->response.data, tok);
-        return 404;
+        buffer_strcat_htmlescape(w->response.data, url);
+        return HTTP_RESP_NOT_FOUND;
     }
     else {
         buffer_flush(w->response.data);
         buffer_sprintf(w->response.data, "Which API v1 command?");
-        return 400;
+        return HTTP_RESP_BAD_REQUEST;
     }
 }

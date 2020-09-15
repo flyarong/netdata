@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
 # Cross-arch docker publish helper script
 # Needs docker in version >18.02 due to usage of manifests
 #
@@ -15,16 +16,24 @@ fi
 
 WORKDIR="$(mktemp -d)" # Temporary folder, removed after script is done
 VERSION="$1"
-REPOSITORY="${REPOSITORY:-netdata}"
-declare -A ARCH_MAP
-ARCH_MAP=(["i386"]="386" ["amd64"]="amd64" ["armhf"]="arm" ["aarch64"]="arm64")
-DEVEL_ARCHS=(amd64)
-ARCHS="${!ARCH_MAP[@]}"
-DOCKER_CMD="docker --config ${WORKDIR}"
 
-# When development mode is set, build on DEVEL_ARCHS
-if [ ! -z ${DEVEL+x} ]; then
-    declare -a ARCHS=(${DEVEL_ARCHS[@]})
+if [ -z "${ARCH}" ]; then
+  echo "ARCH not set, build cannot proceed"
+  exit 1
+fi
+
+DOCKER_CMD="docker --config ${WORKDIR}"
+GIT_MAIL=${GIT_MAIL:-"bot@netdata.cloud"}
+GIT_USER=${GIT_USER:-"netdatabot"}
+
+if [ -z ${REPOSITORY} ]; then
+	REPOSITORY="${TRAVIS_REPO_SLUG}"
+	if [ -z ${REPOSITORY} ]; then
+		echo "REPOSITORY not set, publish cannot proceed"
+		exit 1
+	else
+		echo "REPOSITORY was not detected, attempted to use TRAVIS_REPO_SLUG setting: ${TRAVIS_REPO_SLUG}"
+	fi
 fi
 
 # Ensure there is a version, the most appropriate one
@@ -37,7 +46,7 @@ fi
 MANIFEST_LIST="${REPOSITORY}:${VERSION}"
 
 # There is no reason to continue if we cannot log in to docker hub
-if [ -z ${DOCKER_USERNAME+x} ] || [ -z ${DOCKER_PASS+x} ]; then
+if [ -z ${DOCKER_USERNAME+x} ] || [ -z ${DOCKER_PWD+x} ]; then
     echo "No docker hub username or password found, aborting without publishing"
     exit 1
 fi
@@ -52,43 +61,45 @@ if [ ! -z $CWD ] || [ ! "${TOP_LEVEL}" == "netdata" ]; then
 fi
 
 echo "Docker image publishing in progress.."
-echo "Version       : ${VERSION}"
-echo "Repository    : ${REPOSITORY}"
-echo "Architectures : ${ARCHS[*]}"
-echo "Manifest list : ${MANIFEST_LIST}"
+echo "Version      : ${VERSION}"
+echo "Repository   : ${REPOSITORY}"
+echo "Architecture : ${ARCH}"
+echo "Manifest list: ${MANIFEST_LIST}"
 
 # Create temporary docker CLI config with experimental features enabled (manifests v2 need it)
 echo '{"experimental":"enabled"}' > "${WORKDIR}"/config.json
 
 # Login to docker hub to allow futher operations
-echo "$DOCKER_PASS" | $DOCKER_CMD login -u "$DOCKER_USERNAME" --password-stdin
+echo "$DOCKER_PWD" | $DOCKER_CMD login -u "$DOCKER_USERNAME" --password-stdin
 
 # Push images to registry
-for ARCH in ${ARCHS[@]}; do
-    TAG="${MANIFEST_LIST}-${ARCH}"
-    echo "Publishing image ${TAG}.."
-    $DOCKER_CMD push "${TAG}" &
-    echo "Image ${TAG} published succesfully!"
-done
+TAG="${MANIFEST_LIST}-${ARCH}"
+echo "Publishing image ${TAG}.."
+$DOCKER_CMD push "${TAG}"
 
-echo "Waiting for images publishing to complete"
-wait
+published() {
+	curl -s "https://registry.hub.docker.com/v2/repositories/${REPOSITORY}/tags" | jq -e -r '.results[] | select(.name == "'"${VERSION}-${ARCH}"'")' > /dev/null
+}
+retry 5 published
+
+echo "Image ${TAG} published succesfully!"
 
 # Recreate docker manifest list
+echo "Getting tag list for version '${VERSION}'.."
+TAGS=($(curl -s https://registry.hub.docker.com/v2/repositories/${REPOSITORY}/tags/ | jq -r '.results[]["name"]' | grep "^${VERSION}-"))
+
 echo "Creating manifest list.."
-$DOCKER_CMD manifest create --amend "${MANIFEST_LIST}" \
-                                    "${MANIFEST_LIST}-i386" \
-                                    "${MANIFEST_LIST}-armhf" \
-                                    "${MANIFEST_LIST}-aarch64" \
-                                    "${MANIFEST_LIST}-amd64"
+$DOCKER_CMD manifest create --amend "${MANIFEST_LIST}" "${TAGS[@]/#/${REPOSITORY}:}"
 
 # Annotate manifest with CPU architecture information
+declare -A ARCH_MAP
+ARCH_MAP=(["i386"]="386" ["amd64"]="amd64" ["armhf"]="arm" ["aarch64"]="arm64")
 
 echo "Executing manifest annotate.."
-for ARCH in ${ARCHS[@]}; do
-     TAG="${MANIFEST_LIST}-${ARCH}"
-     echo "Annotating manifest for $ARCH, with TAG: ${TAG} (Manifest list: ${MANIFEST_LIST})"
-     $DOCKER_CMD manifest annotate "${MANIFEST_LIST}" "${TAG}" --os linux --arch "${ARCH_MAP[$ARCH]}"
+for TAG in "${TAGS[@]}"; do
+     ARCH="${TAG#${VERSION}-}"
+     echo "Annotating manifest for $ARCH, with TAG: ${REPOSITORY}:${TAG} (Manifest list: ${MANIFEST_LIST})"
+     $DOCKER_CMD manifest annotate "${MANIFEST_LIST}" "${REPOSITORY}:${TAG}" --os linux --arch "${ARCH_MAP[$ARCH]}"
 done
 
 # Push manifest to docker hub
